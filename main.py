@@ -6,6 +6,7 @@ import seaborn as sns
 import xgboost as xgb
 from src import config
 from src.data_fetcher import fetch_historical_deribit_data
+from src.sanity_checks import run_sanity_checks
 from src.data_loader import clean_deribit_options_data, save_processed_data
 from src.features import engineer_features
 from src.baseline import vectorized_black_scholes
@@ -21,6 +22,62 @@ print("==================================================")
 
 target_file = "deribit_options_chain_2024-01-01_OPTIONS.csv.gz"
 raw_path = os.path.join(config.RAW_DATA_DIR, target_file)
+
+def validate_put_call_parity():
+    """
+    Mathematical validation of the Black-Scholes implementation.
+
+    Put-Call Parity:
+
+    C - P = S - K exp(-rT)
+
+    If the BS implementation is correct, parity errors should
+    be near machine precision.
+    """
+
+    print("\n" + "=" * 60)
+    print("PUT-CALL PARITY VALIDATION")
+    print("=" * 60)
+
+    np.random.seed(42)
+
+    N = 100_000
+
+    S = np.random.uniform(10000, 70000, N)
+    K = np.random.uniform(10000, 70000, N)
+    T = np.random.uniform(1/365, 2.0, N)
+
+    sigma = np.random.uniform(0.20, 1.00, N)
+
+    call_prices = vectorized_black_scholes(
+        S=S,
+        K=K,
+        T=T,
+        r=config.RISK_FREE_RATE,
+        sigma=sigma,
+        option_type="call"
+    )
+
+    put_prices = vectorized_black_scholes(
+        S=S,
+        K=K,
+        T=T,
+        r=config.RISK_FREE_RATE,
+        sigma=sigma,
+        option_type="put"
+    )
+
+    lhs = call_prices - put_prices
+    rhs = S - K * np.exp(-config.RISK_FREE_RATE * T)
+
+    errors = lhs - rhs
+
+    print(f"Mean Error      : {np.mean(errors):.12f}")
+    print(f"Median Error    : {np.median(errors):.12f}")
+    print(f"Std Error       : {np.std(errors):.12f}")
+    print(f"Max Abs Error   : {np.max(np.abs(errors)):.12f}")
+
+    print("=" * 60)
 
 # ------------------------------------------------------------------ #
 # Step 0: Data guard                                                 #
@@ -39,6 +96,7 @@ else:
 # ------------------------------------------------------------------ #
 # Step 1: Load & clean                                               #
 # ------------------------------------------------------------------ #
+validate_put_call_parity()
 print("\n[1/6] Loading and parsing market microstructure records...")
 raw_df = clean_deribit_options_data(target_file)
 
@@ -102,6 +160,44 @@ if is_put.any():
     bs_prices[is_put.values] = put_prices
 
 feat_df['bs_baseline_price'] = bs_prices
+
+# ==========================================================
+# Benchmark 2: Black-Scholes using Deribit implied volatility
+# ==========================================================
+
+print("\nIV DIAGNOSTICS")
+print(feat_df['mark_iv'].describe())
+print(feat_df['mark_iv'].head())
+
+# TEMPORARY assumption:
+# If diagnostics later show values like 75, keep /100.
+# If they show values like 0.75, remove /100.
+feat_df['implied_vol'] = feat_df['mark_iv'] / 100.0
+
+bs_iv_prices = vectorized_black_scholes(
+    S=feat_df['underlying_price'].values,
+    K=feat_df['strike'].values,
+    T=feat_df['T'].values,
+    r=config.RISK_FREE_RATE,
+    sigma=feat_df['implied_vol'].values,
+    option_type="call",
+)
+
+if is_put.any():
+    put_iv_prices = vectorized_black_scholes(
+        S=feat_df.loc[is_put, 'underlying_price'].values,
+        K=feat_df.loc[is_put, 'strike'].values,
+        T=feat_df.loc[is_put, 'T'].values,
+        r=config.RISK_FREE_RATE,
+        sigma=feat_df.loc[is_put, 'implied_vol'].values,
+        option_type="put",
+    )
+
+    bs_iv_prices[is_put.values] = put_iv_prices
+
+feat_df['bs_iv_price'] = bs_iv_prices
+run_sanity_checks(feat_df)
+
 feat_df['residual_target']   = feat_df['market_mid'] - feat_df['bs_baseline_price']
 
 save_processed_data(feat_df, "deribit_processed_features.csv")
@@ -136,17 +232,31 @@ ml_model.save_model(os.path.join(config.MODEL_DIR, "xgboost_residual_pricer.json
 test_pred_residuals = ml_model.predict(X_test)
 hybrid_prices       = test_set['bs_baseline_price'].values + test_pred_residuals
 
-bs_rmse     = compute_rmse(test_set['market_mid'].values, test_set['bs_baseline_price'].values)
-hybrid_rmse = compute_rmse(test_set['market_mid'].values, hybrid_prices)
+bs_rmse = compute_rmse(
+    test_set['market_mid'].values,
+    test_set['bs_baseline_price'].values
+)
+
+bs_iv_rmse = compute_rmse(
+    test_set['market_mid'].values,
+    test_set['bs_iv_price'].values
+)
+
+hybrid_rmse = compute_rmse(
+    test_set['market_mid'].values,
+    hybrid_prices
+)
+
 improvement = (bs_rmse - hybrid_rmse) / bs_rmse * 100
 
 print("\n" + "=" * 50)
 print("HYBRID PRICING ENGINE COMPLETED SUCCESSFULLY")
 print("=" * 50)
-print(f"Out-of-Sample BS Baseline RMSE : {bs_rmse:.4f} USD")
+print(f"Out-of-Sample BS(HV) RMSE      : {bs_rmse:.4f} USD")
+print(f"Out-of-Sample BS(IV) RMSE      : {bs_iv_rmse:.4f} USD")
 print(f"Out-of-Sample Hybrid RMSE      : {hybrid_rmse:.4f} USD")
 print(f"Structural Error Reduction     : {improvement:.2f}%")
-print("==================================================")
+print("=" * 50)
 
 # ------------------------------------------------------------------ #
 # Step 7: Visual Diagnostic Plot Generation                          #

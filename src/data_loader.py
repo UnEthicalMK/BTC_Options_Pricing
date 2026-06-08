@@ -80,6 +80,15 @@ def clean_deribit_options_data(file_name: str) -> pd.DataFrame:
     # Convert BTC premium to USD premium
     df['market_mid'] = ((df['best_bid'] + df['best_ask']) / 2.0) * df['underlying_price']
 
+    # Deribit IVs are typically quoted in %
+    df['implied_vol'] = df['mark_iv'] / 100.0
+
+    # Safety filter
+    df = df[
+        (df['implied_vol'] > 0.01) &
+        (df['implied_vol'] < 5.0)
+    ]
+
     # Timestamps are in microseconds (Tardis options_chain schema)
     time_to_exp_seconds = (
         df['expiration'] - df['timestamp']
